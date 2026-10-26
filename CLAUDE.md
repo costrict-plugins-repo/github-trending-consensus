@@ -1,0 +1,85 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Overview
+
+Consensus is a Claude Code plugin that queries multiple AI providers (GPT-6 Astra, Gemini 4 Argon, and DeepSeek V4 Pro via OpenRouter by default) concurrently via async Python, then synthesizes their responses. Additional providers can be enabled in config. It has no build system — pure Python 3.11+ with `uv` for dependency resolution via PEP 723 inline script metadata.
+
+## Running the Core Engine
+
+```bash
+# Standard invocation (from project using the plugin)
+uv run scripts/consensus.py <prompt-file.md> --plugin-root . [--search-mode web|none] [--output-dir DIR] [--config CONFIG]
+
+# Validate prerequisites (SessionStart hook)
+bash scripts/check-setup.sh
+```
+
+There are no tests, linter, or build commands. The only runtime dependency is `aiohttp>=3.8.0`, auto-resolved by `uv`.
+
+## Architecture
+
+### Plugin Components
+
+- **`.claude-plugin/plugin.json`** — Plugin manifest (name: `consensus`)
+- **`skills/ask/SKILL.md`** — `/consensus:ask` skill; orchestrates the full workflow (analyze context → craft prompt → run engine → synthesize results). Also auto-triggers on phrases like "consensus", "second opinion", "cross-check"
+- **`hooks/hooks.json`** — SessionStart hook runs `check-setup.sh` to validate `uv` and API key availability (informational only, never fails)
+- **`consensus_config.json`** — Default configuration template; users can copy to project root to override
+
+### Core Engine (`scripts/consensus.py`)
+
+Single-file async Python engine (~560 lines). Key flow:
+
+1. `load_config()` — 5-tier config resolution: CLI `--config` → `./consensus_config.json` → `~/.claude/consensus_config.json` → `<plugin-root>/consensus_config.json` → built-in `DEFAULT_CONFIG`. Environment variables always override API keys. The project-local file is untrusted: `_strip_untrusted_fields()` removes its `api_keys`, `endpoints` and per-provider `endpoint`. After loading, `_enforce_allowed_endpoints()` resets any endpoint that is not https on the official host (`ALLOWED_ENDPOINT_HOSTS`).
+2. `setup_providers()` — Dynamically initializes providers based on config `enabled`/`use_openrouter` flags and available API keys. Missing keys cause skip, not failure.
+3. `query_all_providers()` — Fires all provider queries concurrently via `asyncio.create_task` + `asyncio.as_completed`.
+4. `consolidate_responses()` — Writes markdown with per-provider sections to a temp directory (or `--output-dir` if specified).
+
+### Provider Class Hierarchy
+
+- `AIProvider` — Abstract base with `name`, `api_key`, `available`, `config`
+- `OpenAIProvider` — Direct API; GPT-5 and later (gpt-5.x, gpt-6-*, ...) use the Responses API with reasoning effort levels, older models use chat completions
+- `GeminiProvider` — Direct Gemini API with exponential backoff retry (3 retries, 1s→2s→4s); 32768 token limit
+- `OpenRouterProvider` — Generic OpenRouter proxy; model selected by search mode from `openrouter_model` config map; adds web plugin when model doesn't end with `:online`
+
+### Search Modes
+
+- **`web`** (default) — Providers include web search; models use `:online` variants or web plugins
+- **`none`** — No web search; faster responses; lower reasoning effort for GPT-5 and later on the direct OpenAI API
+
+### Key Environment Variables
+
+- `OPENROUTER_API_KEY` — Routes all three default providers; only key needed for default setup
+- `OPENAI_API_KEY`, `GEMINI_API_KEY` — Optional; for direct API access when `use_openrouter` is false
+- `CLAUDE_PLUGIN_ROOT` — Injected by Claude Code; used in command/skill markdown templates
+
+## Deploying Changes
+
+The plugin is installed via a marketplace that points to the GitHub repo. Claude Code caches the plugin by version, so pushing code alone is not enough — users won't see changes until the version changes.
+
+**Every time you make changes, you must:**
+
+1. Bump the `version` in `.claude-plugin/plugin.json` (semver: patch for fixes, minor for features)
+2. Commit the version bump together with your changes
+3. Push to GitHub
+
+The user then runs `/plugin update consensus@kahidreamers-marketplace` to pick up the new version. Auto-update is disabled by default for third-party marketplaces — users must enable it via `/plugin` → Marketplaces → Enable auto-update.
+
+**Do not** commit and push without bumping the version — the cached copy will be served and changes will be invisible.
+
+### Marketplace
+
+The marketplace is a separate repo: `mark-kimura/kahidreamers-marketplace`. When bumping the plugin version, also update the `version` field in the marketplace's `.claude-plugin/marketplace.json` and push both repos.
+
+- The marketplace plugin source must use the explicit object format `{"source": "github", "repo": "..."}` — the string shorthand `"./"` silently fails to register
+- Both repos must be **public** for other users to install
+
+## Conventions
+
+- API keys come exclusively from environment variables, never stored in config files
+- Never send an API key to a host outside `ALLOWED_ENDPOINT_HOSTS`, and never let `./consensus_config.json` set keys or endpoints
+- `_deep_merge()` is used for config layering — override dicts merge recursively, other values replace
+- Output files go to a temp directory by default; use `--output-dir` to persist to a specific location
+- Command and skill markdown files use YAML frontmatter for `allowed-tools`, `description`, and `argument-hint`
+- The `check-setup.sh` hook outputs both JSON (for structured consumption) and human-readable warnings to stderr
